@@ -1,0 +1,4 @@
+# Sillage - Apple Silicon (M1/M2/M3/M4)
+# pip install -r requirements-mac.txt
+
+mlx-whisper

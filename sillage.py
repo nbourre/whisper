@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 sillage.py
-Transcription audio locale avec mlx-whisper sur Apple Silicon.
+Transcription audio locale multiplateforme.
+
+Backends détectés automatiquement :
+  macOS Apple Silicon  -> mlx-whisper    (pip install -r requirements-mac.txt)
+  Windows/Linux NVIDIA -> faster-whisper (pip install -r requirements-pc.txt)
 
 Mode CLI (avec arguments) :
   python sillage.py audio.mp3
@@ -15,8 +19,43 @@ Mode interactif (sans argument) :
 import argparse
 import json
 import os
+import platform
 import sys
 from pathlib import Path
+
+
+# --------------------------------------------------------------------------- #
+# Détection de plateforme
+# --------------------------------------------------------------------------- #
+
+def detect_backend() -> str:
+    """
+    Retourne 'mlx' sur Apple Silicon, 'faster' partout ailleurs.
+    La détection se fait via platform.machine() qui retourne 'arm64' sur M1/M2/M3/M4.
+    """
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "mlx"
+    return "faster"
+
+
+BACKEND = detect_backend()
+
+MODELS = {
+    "mlx": {
+        "fast":     "mlx-community/whisper-small-mlx",
+        "accuracy": "mlx-community/whisper-large-v3-mlx",
+    },
+    "faster": {
+        "fast":     "small",
+        "accuracy": "large-v3",
+    },
+}
+
+BACKEND_LABEL = {
+    "mlx":    "mlx-whisper  (Apple Silicon)",
+    "faster": "faster-whisper (CUDA / CPU)",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Persistance des préférences
@@ -35,7 +74,6 @@ def load_prefs() -> dict:
         try:
             with open(PREFS_FILE, "r") as f:
                 prefs = json.load(f)
-            # Fusionner avec les défauts pour les clés manquantes
             return {**DEFAULT_PREFS, **prefs}
         except Exception:
             pass
@@ -50,7 +88,7 @@ def save_prefs(prefs: dict):
 
 
 # --------------------------------------------------------------------------- #
-# Formatage des timestamps (style FoziScribe : [00:01:23])
+# Formatage des timestamps
 # --------------------------------------------------------------------------- #
 
 def format_timestamp(seconds: float) -> str:
@@ -66,50 +104,84 @@ def format_timestamp(seconds: float) -> str:
 def format_transcript(segments) -> str:
     lines = []
     for seg in segments:
-        timestamp = format_timestamp(seg["start"])
-        text = seg["text"].strip()
+        # Compatibilité mlx (dict) et faster-whisper (objet avec attributs)
+        start = seg["start"] if isinstance(seg, dict) else seg.start
+        text  = seg["text"]  if isinstance(seg, dict) else seg.text
+        text  = text.strip()
         if text:
-            lines.append(f"{timestamp} {text}")
+            lines.append(f"{format_timestamp(start)} {text}")
     return "\n\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
-# Transcription
+# Backends de transcription
 # --------------------------------------------------------------------------- #
 
-MODELS = {
-    "fast":     "mlx-community/whisper-small-mlx",
-    "accuracy": "mlx-community/whisper-large-v3-mlx",
-}
-
-SUPPORTED_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm", ".mp4", ".mov"}
-
-def transcribe(audio_path: str, mode: str = "accuracy") -> dict:
+def transcribe_mlx(audio_path: str, mode: str) -> dict:
     try:
         import mlx_whisper
     except ImportError:
         print("\n  mlx-whisper n'est pas installé.")
-        print("  Lance : pip install mlx-whisper\n")
+        print("  Lance : pip install -r requirements-mac.txt\n")
         sys.exit(1)
 
-    model_repo = MODELS.get(mode, MODELS["accuracy"])
-
-    print(f"\n  Modèle  : {model_repo}")
-    print(f"  Fichier : {audio_path}")
-    print(f"  Mode    : {mode}")
-    print()
-
+    model_repo = MODELS["mlx"][mode]
     result = mlx_whisper.transcribe(
         audio_path,
         path_or_hf_repo=model_repo,
         word_timestamps=(mode == "accuracy"),
         verbose=False,
     )
-    return result
+    # Normalise en dict uniforme
+    return {
+        "language": result.get("language", "inconnu"),
+        "segments": result.get("segments", []),
+    }
 
+
+def transcribe_faster(audio_path: str, mode: str) -> dict:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("\n  faster-whisper n'est pas installé.")
+        print("  Lance : pip install -r requirements-pc.txt\n")
+        sys.exit(1)
+
+    model_name = MODELS["faster"][mode]
+    model = WhisperModel(model_name, device="cuda", compute_type="float16")
+    segments_gen, info = model.transcribe(
+        audio_path,
+        beam_size=5,
+        word_timestamps=(mode == "accuracy"),
+    )
+    # Matérialise le générateur en liste pour pouvoir l'itérer plusieurs fois
+    segments = list(segments_gen)
+    return {
+        "language": info.language,
+        "segments": segments,
+    }
+
+
+def transcribe(audio_path: str, mode: str = "accuracy") -> dict:
+    model_id = MODELS[BACKEND][mode]
+    print(f"\n  Backend : {BACKEND_LABEL[BACKEND]}")
+    print(f"  Modèle  : {model_id}")
+    print(f"  Fichier : {audio_path}")
+    print(f"  Mode    : {mode}")
+    print()
+
+    if BACKEND == "mlx":
+        return transcribe_mlx(audio_path, mode)
+    else:
+        return transcribe_faster(audio_path, mode)
+
+
+# --------------------------------------------------------------------------- #
+# Affichage et sauvegarde
+# --------------------------------------------------------------------------- #
 
 def print_result(result: dict, audio_path: str, mode: str):
-    lang = result.get("language", "inconnu")
+    lang     = result.get("language", "inconnu")
     segments = result.get("segments", [])
     transcript = format_transcript(segments)
 
@@ -120,6 +192,7 @@ def print_result(result: dict, audio_path: str, mode: str):
     print(f"  Fichier  : {Path(audio_path).name}")
     print(f"  Langue   : {lang.upper()}")
     print(f"  Mode     : {mode.capitalize()}")
+    print(f"  Backend  : {BACKEND_LABEL[BACKEND]}")
     print(f"  Segments : {len(segments)}")
     print("-" * width)
     print()
@@ -129,7 +202,7 @@ def print_result(result: dict, audio_path: str, mode: str):
 
 
 def save_result(result: dict, output_path: str):
-    segments = result.get("segments", [])
+    segments   = result.get("segments", [])
     transcript = format_transcript(segments)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(transcript)
@@ -164,7 +237,7 @@ def setup_path_completion():
         readline.set_completer_delims(" \t\n;")
         readline.parse_and_bind("tab: complete")
     except Exception:
-        pass  # Pas critique si ça ne marche pas
+        pass
 
 
 def remove_path_completion():
@@ -185,14 +258,15 @@ BANNER = r"""
  _\ \/ / / / _ `/ _ `/ -_)
 /___/_/_/_/\_,_/\_, /\__/ 
     ~^~^~^~^~  /___/~^~^~^
-  Apple Silicon  •  mlx-whisper
 """
 
+SUPPORTED_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm", ".mp4", ".mov"}
+
+
 def clear():
-    os.system("clear")
+    os.system("cls" if platform.system() == "Windows" else "clear")
 
 def prompt(msg: str, default: str = "") -> str:
-    """Affiche un prompt avec la valeur par défaut entre crochets."""
     suffix = f" [{default}]" if default else ""
     return input(f"{msg}{suffix} : ").strip()
 
@@ -201,15 +275,12 @@ def ask_quit(value: str) -> bool:
 
 
 def menu_main(prefs: dict) -> dict | None:
-    """
-    Menu principal. Retourne un dict de paramètres à lancer,
-    ou None si l'utilisateur veut quitter.
-    """
     while True:
         clear()
         print(BANNER)
+        print(f"  Backend : {BACKEND_LABEL[BACKEND]}")
+        print()
 
-        # Résumé des réglages actuels
         mode_label = "Rapide (whisper-small)" if prefs["mode"] == "fast" else "Précis (whisper-large-v3)"
         out_label  = prefs["output_dir"] if prefs["output_dir"] else "même dossier que le fichier audio"
         last_audio = prefs["last_audio"] if prefs["last_audio"] else "aucun"
@@ -219,7 +290,7 @@ def menu_main(prefs: dict) -> dict | None:
         print(f"    [2] Dossier sortie : {out_label}")
         print()
         print("  Actions")
-        print(f"    [3] Transcire un fichier (dernier : {last_audio})")
+        print(f"    [3] Transcrire un fichier (dernier : {last_audio})")
         print()
         print("    [q] Quitter")
         print()
@@ -229,18 +300,14 @@ def menu_main(prefs: dict) -> dict | None:
         if ask_quit(choice):
             print("\n  À bientôt!\n")
             return None
-
         elif choice == "1":
             prefs = menu_mode(prefs)
-
         elif choice == "2":
             prefs = menu_output_dir(prefs)
-
         elif choice == "3":
             params = menu_transcribe(prefs)
             if params:
                 return params
-
         else:
             input("  Choix invalide. Appuie sur Entrée pour continuer...")
 
@@ -285,8 +352,7 @@ def menu_output_dir(prefs: dict) -> dict:
     print()
 
     setup_path_completion()
-    current = prefs["output_dir"] or ""
-    val = prompt("  Dossier", current)
+    val = prompt("  Dossier", prefs["output_dir"] or "")
     remove_path_completion()
 
     if ask_quit(val):
@@ -294,9 +360,7 @@ def menu_output_dir(prefs: dict) -> dict:
 
     val = str(Path(val).expanduser()) if val else ""
     prefs["output_dir"] = val
-
-    label = val if val else "même dossier que le fichier audio"
-    print(f"\n  Dossier de sortie : {label}")
+    print(f"\n  Dossier de sortie : {val or 'même dossier que le fichier audio'}")
 
     save_prefs(prefs)
     input("\n  Entrée pour continuer...")
@@ -304,7 +368,6 @@ def menu_output_dir(prefs: dict) -> dict:
 
 
 def menu_transcribe(prefs: dict) -> dict | None:
-    """Demande le fichier audio et confirme les paramètres. Retourne les params ou None."""
     clear()
     print(BANNER)
     print("  Transcription d'un fichier audio")
@@ -338,7 +401,6 @@ def menu_transcribe(prefs: dict) -> dict | None:
     if Path(audio_path).suffix.lower() not in SUPPORTED_EXT:
         print(f"\n  Attention : extension non reconnue ({Path(audio_path).suffix}), on essaie quand même.")
 
-    # Résumé avant lancement
     mode_label = "Rapide (whisper-small)" if prefs["mode"] == "fast" else "Précis (whisper-large-v3)"
     out_path   = resolve_output_path(audio_path, prefs["output_dir"])
     out_label  = prefs["output_dir"] if prefs["output_dir"] else "même dossier que le fichier audio"
@@ -347,6 +409,7 @@ def menu_transcribe(prefs: dict) -> dict | None:
     print("  " + "-" * 50)
     print(f"  Fichier  : {Path(audio_path).name}")
     print(f"  Mode     : {mode_label}")
+    print(f"  Backend  : {BACKEND_LABEL[BACKEND]}")
     print(f"  Sortie   : {out_label}")
     print("  " + "-" * 50)
     print()
@@ -377,9 +440,8 @@ def run_transcription(audio_path: str, mode: str, output_path: str):
 
 def main():
     if len(sys.argv) > 1:
-        # Mode CLI classique
         parser = argparse.ArgumentParser(
-            description="Transcription audio locale style FoziScribe (Apple Silicon)"
+            description="Sillage — transcription audio locale multiplateforme"
         )
         parser.add_argument("audio", help="Chemin vers le fichier audio")
         parser.add_argument(
@@ -403,7 +465,6 @@ def main():
         run_transcription(audio_path, mode, output_path)
 
     else:
-        # Mode interactif
         prefs = load_prefs()
         params = menu_main(prefs)
         if params:
