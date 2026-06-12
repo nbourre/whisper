@@ -1,7 +1,7 @@
-# Sillage - Windows/Linux avec GPU NVIDIA (CUDA)
+# Sillage - Windows/Linux with NVIDIA GPU (CUDA)
 # pip install -r requirements-pc.txt
 
 faster-whisper
 
-# Si tu veux les timestamps au mot près + diarisation des locuteurs :
+# If you want word-level timestamps + speaker diarization:
 whisperx
